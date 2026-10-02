@@ -479,6 +479,9 @@ nni_pipe_set_pid(nni_pipe *new_pipe, uint32_t id)
 	if ((p = nni_id_get(&pipes, id)) != NULL) {
 		bool cached = nni_atomic_get_bool(&p->cache);
 		rv          = nni_id_set(&pipes, id, new_pipe);
+		// Hold the old pipe across the unlock: pipe_destroy drains
+		// p_ref under pipes_lk before it frees the pipe.
+		p->p_ref++;
 		// Kick out duplicated Client ID
 		nni_mtx_unlock(&pipes_lk);
 		// The pipe id is a hash of the client id, so a collision here
@@ -496,6 +499,7 @@ nni_pipe_set_pid(nni_pipe *new_pipe, uint32_t id)
 			// so that new pipe can inherit.
 			nni_pipe_close(p);
 		}
+		nni_pipe_rele(p);
 		return rv;
 	}
 
