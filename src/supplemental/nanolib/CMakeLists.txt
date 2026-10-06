@@ -33,9 +33,14 @@ nng_test(hash_test)
 nng_test(dbtree_test)
 nng_test(cmd_test)
 nng_test(conf_test)
+if (TARGET conf_test)
+  target_compile_definitions(conf_test PRIVATE
+    NANOMQ_TEST_CONF_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test_conf")
+endif ()
 nng_test(env_test)
 nng_test(rule_test)
 nng_test(lib_base64_test)
+nng_test(nmq_base64_test)
 nng_test(topics_test)
 
 if (SUPP_RULE_ENGINE)
@@ -44,4 +49,3 @@ if (SUPP_RULE_ENGINE)
 endif (SUPP_RULE_ENGINE)
 
 add_subdirectory(linkedlist)
-

@@ -7,12 +7,6 @@
 #include <string.h>
 #include "nng/nng.h"
 
-
-typedef enum {
-	MQTT_VERSION_V311 = 4,
-	MQTT_VERSION_V5   = 5,
-} mqtt_version_t;
-
 typedef struct dbtree            dbtree;
 
 typedef struct {
@@ -113,9 +107,10 @@ NNG_DECL nng_msg *dbtree_delete_retain(dbtree *db, char *topic);
  * @brief dbtree_find_retain - Get all retain message to this topic.
  * @param db - dbtree
  * @param topic - topic
+ * @param rets - vector of retained msgs
  * @return dbtree_retain_msg pointer vector
  */
-NNG_DECL nng_msg **dbtree_find_retain(dbtree *db, char *topic);
+NNG_DECL nng_msg ***dbtree_find_retain(dbtree *db, char *topic, nng_msg ***vec);
 
 /**
  * @brief dbtree_find_shared_clients - This function

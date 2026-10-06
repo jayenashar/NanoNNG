@@ -1,3 +1,11 @@
+// Copyright 2026 Liebherr-Digital Development Center (LDC) <peter.bestler@liebherr.de>
+//
+// This software is supplied under the terms of the MIT License, a
+// copy of which should be located in the distribution where this
+// file was obtained (LICENSE.txt).  A copy of the license may also be
+// found online at https://opensource.org/licenses/MIT.
+//
+
 #ifndef CONF_H
 #define CONF_H
 
@@ -602,6 +610,7 @@ typedef struct conf_web_hook  conf_web_hook;
 
 struct conf_nng_pub_node {
 	char       *name;
+	bool        enable;
 	nng_socket  pub_sock;
 	char       *pub_url;
 	char       *clientid;
@@ -613,6 +622,7 @@ typedef struct conf_nng_pub_node conf_nng_pub_node;
 
 struct conf_nng_sub_node {
 	char      *name;
+	bool       enable;
 	nng_socket sub_sock;
 	char      *sub_url;
 	char       *clientid;
@@ -712,6 +722,8 @@ NNG_DECL int  get_time(const char *str, uint64_t *second);
 NNG_DECL int  get_time_ms(const char *str, uint64_t *second);
 NNG_DECL void conf_parse(conf *nanomq_conf);
 NNG_DECL void conf_parse_ver2(conf *nanomq_conf, bool is_reload);
+/** Returns whether value is a PKCS#11 URI, matched case-insensitively. */
+NNG_DECL bool conf_tls_is_pkcs11_uri(const char *value);
 NNG_DECL void conf_gateway_parse_ver2(zmq_gateway_conf *gateway);
 NNG_DECL void conf_vsomeip_gateway_parse_ver2(vsomeip_gateway_conf *config);
 NNG_DECL void conf_dds_gateway_init(dds_gateway_conf *config);

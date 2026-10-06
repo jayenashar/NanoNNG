@@ -203,11 +203,12 @@ scram_ctx_update(void *arg, char *salt)
 {
 	struct scram_ctx *ctx   = arg;
 	int               keysz = ctx->digestsz;
-
-	ctx->salt = salt;
-	if (ctx->salt == NULL) {
+	if (salt == NULL) {
 		return -1;
 	}
+	if (ctx->salt)
+		nng_free(ctx->salt, 0);
+	ctx->salt = salt;
 
 	char *salt_pwd = nng_alloc(sizeof(char) * ctx->digestsz);
 	if (!salt_pwd)
@@ -223,12 +224,28 @@ scram_ctx_update(void *arg, char *salt)
 		ctx->salt = NULL;
 		return -2;
 	}
+	if (ctx->salt_pwd)
+		nng_free(ctx->salt_pwd, 0);
 	ctx->salt_pwd = salt_pwd;
 
+	if (ctx->client_key)
+		nng_free(ctx->client_key, 0);
+	if (ctx->server_key)
+		nng_free(ctx->server_key, 0);
+	if (ctx->stored_key)
+		nng_free(ctx->stored_key, 0);
+	ctx->client_key = NULL;
+	ctx->server_key = NULL;
+	ctx->stored_key = NULL;
 	ctx->client_key = client_key(ctx->digest, salt_pwd, keysz);
 	ctx->server_key = server_key(ctx->digest, salt_pwd, keysz);
+	if (ctx->client_key == NULL || ctx->server_key == NULL) {
+		return -3;
+	}
 	ctx->stored_key = stored_key(ctx->digest, ctx->client_key, keysz);
-
+	if (ctx->stored_key == NULL) {
+		return -3;
+	}
 	return 0;
 }
 
@@ -285,7 +302,7 @@ scram_ctx_create(
 	snprintf(saltstr, SCRAM_SALT_SZ, "%d", salt);
 	if (0 != (rv = scram_ctx_update(ctx, saltstr))) {
 		log_error("error in updating ctx %d", rv);
-		nng_free(ctx, 0);
+		scram_ctx_free(ctx);
 		return NULL;
 	}
 
@@ -324,12 +341,18 @@ static char *
 scram_client_final_msg(char *nonce, const char *proof, int client_proofsz)
 {
 	char  *gh         = gs_header();
-	size_t ghb64sz    = BASE64_ENCODE_OUT_SIZE(strlen(gh)) + 1;
-	char  *ghb64      = nng_alloc(ghb64sz);
-	size_t proofb64sz = BASE64_ENCODE_OUT_SIZE(client_proofsz) + 1;
-	char  *proofb64   = nng_alloc(proofb64sz);
+	size_t ghb64sz    = BASE64_ENCODE_OUT_SIZE(strlen(gh));
+	size_t proofb64sz = BASE64_ENCODE_OUT_SIZE(client_proofsz);
 
-	if (!ghb64 || !proofb64 || ghb64sz == 0 || proofb64sz == 0) {
+	if (ghb64sz == 0 || proofb64sz == 0) {
+		return NULL;
+	}
+	ghb64sz++;
+	proofb64sz++;
+	char *ghb64    = nng_alloc(ghb64sz);
+	char *proofb64 = nng_alloc(proofb64sz);
+
+	if (!ghb64 || !proofb64) {
 		if (ghb64)
 			nng_free(ghb64, 0);
 		if (proofb64)
@@ -337,11 +360,12 @@ scram_client_final_msg(char *nonce, const char *proof, int client_proofsz)
 		return NULL;
 	}
 
-	if (0 ==
-	        nmq_base64_encode((const unsigned char *) gh, strlen(gh), ghb64, ghb64sz) ||
-	    0 ==
-	        nmq_base64_encode(
-	            (const unsigned char *) proof, client_proofsz, proofb64, proofb64sz)) {
+	size_t tlen = nmq_base64_encode(
+	    (const unsigned char *) proof, client_proofsz, proofb64, proofb64sz);
+	size_t rlen = nmq_base64_encode(
+	    (const unsigned char *) gh, strlen(gh), ghb64, ghb64sz);
+
+	if (rlen == (size_t) -1 || rlen == 0 || tlen == (size_t) -1 || tlen == 0) {
 		nng_free(ghb64, 0);
 		nng_free(proofb64, 0);
 		return NULL;
@@ -364,23 +388,25 @@ scram_client_final_msg(char *nonce, const char *proof, int client_proofsz)
 static char *
 scram_server_first_msg(char *nonce, const char *salt, int iteration_cnt)
 {
-	size_t saltb64sz = BASE64_ENCODE_OUT_SIZE(strlen(salt)) + 1;
-	char  *saltb64   = nng_alloc(saltb64sz);
-	if (saltb64sz == 0 || !saltb64)
+	size_t saltb64sz = BASE64_ENCODE_OUT_SIZE(strlen(salt));
+	if (saltb64sz == 0)
+		return NULL;
+	saltb64sz++;
+	char *saltb64 = nng_alloc(saltb64sz);
+	if (!saltb64)
 		return NULL;
 
-	if (0 ==
-	    nmq_base64_encode(
-	        (const unsigned char *) salt, strlen(salt), saltb64, saltb64sz)) {
+	size_t elen = nmq_base64_encode(
+	    (const uint8_t *) salt, strlen(salt), saltb64, saltb64sz);
+	if (elen == (size_t) -1 || elen == 0) {
 		nng_free(saltb64, 0);
 		return NULL;
 	}
 
-	size_t bufsz = saltb64sz + strlen(nonce) + 64;
+	size_t bufsz = elen + strlen(nonce) + 64;
 	char  *buf   = nng_alloc(sizeof(char) * bufsz);
 	if (buf) {
-		snprintf(buf, bufsz, "r=%s,s=%s,i=%d", nonce, saltb64,
-		    iteration_cnt);
+		snprintf(buf, bufsz, "r=%s,s=%s,i=%d", nonce, saltb64, iteration_cnt);
 	}
 	nng_free(saltb64, 0);
 	return buf;
@@ -396,18 +422,23 @@ scram_server_final_msg(const char *server_sig, int sz, int error)
 			snprintf(buf, 32, "e=%d", error);
 		return buf;
 	}
-	size_t ssb64sz = BASE64_ENCODE_OUT_SIZE(sz) + 1;
-	char  *ssb64   = nng_alloc(ssb64sz);
-	if (ssb64sz == 0 || !ssb64)
+
+	size_t ssb64sz = BASE64_ENCODE_OUT_SIZE(sz);
+	if (ssb64sz == 0)
+		return NULL;
+	ssb64sz++;
+	char *ssb64 = nng_alloc(ssb64sz);
+	if (!ssb64)
 		return NULL;
 
-	if (0 ==
-	    nmq_base64_encode((const unsigned char *) server_sig, sz, ssb64, ssb64sz)) {
+	size_t elen = nmq_base64_encode(
+	    (const unsigned char *) server_sig, sz, ssb64, ssb64sz);
+	if (elen == (size_t) -1 || elen == 0) {
 		nng_free(ssb64, 0);
 		return NULL;
 	}
 
-	size_t bufsz = ssb64sz + 32;
+	size_t bufsz = elen + 32;
 	buf          = nng_alloc(sizeof(char) * bufsz);
 	if (buf) {
 		snprintf(buf, bufsz, "v=%s", ssb64);
@@ -541,6 +572,7 @@ peek_client_final_msg_without_proof(const char *msg)
 		*end = '\0';
 	return m;
 }
+
 char *
 scram_handle_client_final_msg(void *arg, const char *msg, int len)
 {
@@ -561,7 +593,7 @@ scram_handle_client_final_msg(void *arg, const char *msg, int len)
 	}
 
 	int proofsz = ctx->digestsz;
-	if (strlen(proof) * 3 / 4 > proofsz) {
+	if (strlen(proof) * 3 / 4 > (size_t) proofsz) {
 		goto cleanup;
 	}
 
@@ -593,10 +625,7 @@ scram_handle_client_final_msg(void *arg, const char *msg, int len)
 	char *client_key   = nng_alloc(proofsz);
 	char *client_proof = nng_alloc(proofsz + 1);
 
-	if (!client_key || !client_proof ||
-	    0 ==
-	        nmq_base64_decode(
-	            proof, strlen(proof), (unsigned char *) client_proof, proofsz + 1)) {
+	if (!client_sig || !client_key || !client_proof) {
 		if (client_sig)
 			nng_free(client_sig, 0);
 		if (client_key)
@@ -607,6 +636,19 @@ scram_handle_client_final_msg(void *arg, const char *msg, int len)
 		nng_free(authmsg, authmsg_sz);
 		goto cleanup;
 	}
+
+	size_t rlen = nmq_base64_decode(
+	    proof, strlen(proof), (unsigned char *) client_proof, proofsz + 1);
+	
+	if (rlen == (size_t) -1 || rlen == 0) {
+		nng_free(client_sig, 0);
+		nng_free(client_key, 0);
+		nng_free(client_proof, 0);
+		nng_free(client_final_msg_without_proof, 0);
+		nng_free(authmsg, authmsg_sz);
+		goto cleanup;
+	}
+
 	xor(client_proof, client_sig, client_key, proofsz);
 
 	char *hash_client_key = hash(ctx->digest, client_key, ctx->digestsz);
@@ -648,6 +690,7 @@ scram_handle_server_first_msg(void *arg, const char *msg, int len)
 	char             *it    = (char *) msg;
 	char             *itend = it + len - 1;
 	char             *itnext;
+	char             *client_final_msg = NULL;
 	char             *nonce = get_comma_value(it, itend, &itnext, 2);
 	it                      = itnext;
 	char *saltb64           = get_comma_value(it, itend, &itnext, 2);
@@ -676,8 +719,9 @@ scram_handle_server_first_msg(void *arg, const char *msg, int len)
 		goto cleanup_fields;
 	memset(salt, 0, SCRAM_SALT_SZ);
 
-	if (0 ==
-	    nmq_base64_decode(saltb64, strlen(saltb64), (unsigned char *) salt, SCRAM_SALT_SZ)) {
+	size_t tlen = nmq_base64_decode(
+	    saltb64, strlen(saltb64), (unsigned char *) salt, SCRAM_SALT_SZ);
+	if (tlen == (size_t) -1 || tlen == 0) {
 		nng_free(salt, 0);
 		goto cleanup_fields;
 	}
@@ -685,12 +729,20 @@ scram_handle_server_first_msg(void *arg, const char *msg, int len)
 	scram_ctx_update(ctx, salt);
 
 	char  *gh      = gs_header();
-	size_t ghb64sz = BASE64_ENCODE_OUT_SIZE(strlen(gh)) + 1;
-	char  *ghb64   = nng_alloc(ghb64sz);
-	if (ghb64sz == 0 || !ghb64 ||
-	    0 == nmq_base64_encode((const unsigned char *) gh, strlen(gh), ghb64, ghb64sz)) {
-		if (ghb64)
-			nng_free(ghb64, 0);
+	size_t ghb64sz = BASE64_ENCODE_OUT_SIZE(strlen(gh));
+	if (ghb64sz == 0) {
+		goto cleanup_fields;
+	}
+	ghb64sz ++;
+	char *ghb64 = nng_alloc(ghb64sz);
+	if (!ghb64) {
+		goto cleanup_fields;
+	}
+
+	size_t elen = nmq_base64_encode(
+	    (const unsigned char *) gh, strlen(gh), ghb64, ghb64sz);
+	if (elen == (size_t) -1 || elen == 0) {
+		nng_free(ghb64, 0);
 		goto cleanup_fields;
 	}
 
@@ -738,7 +790,6 @@ scram_handle_server_first_msg(void *arg, const char *msg, int len)
 		xor(ctx->client_key, client_sig, client_proof, client_sig_len);
 	}
 
-	char *client_final_msg = NULL;
 	if (client_proof) {
 		client_final_msg = scram_client_final_msg(
 		    nonce, client_proof, client_sig_len);
@@ -797,12 +848,24 @@ scram_handle_server_final_msg(void *arg, const char *msg, int len)
 	char *server_sig =
 	    scram_hmac(ctx, ctx->server_key, ctx->digestsz, authmsg);
 	log_trace("client: server_key %.*s\n", ctx->digestsz, ctx->server_key);
-	size_t ssb64sz = BASE64_ENCODE_OUT_SIZE(ctx->digestsz) + 1;
-	char  *ssb64   = nng_alloc(ssb64sz);
 
-	if (ssb64sz == 0 || !ssb64 || 0 ==
-	        nmq_base64_encode((const unsigned char *) server_sig,
-	            ctx->digestsz, ssb64, ssb64sz)) {
+	size_t ssb64sz = BASE64_ENCODE_OUT_SIZE(ctx->digestsz);
+	if (ssb64sz == 0) {
+		nng_free(authmsg, authmsg_sz);
+		if (server_sig)
+			nng_free(server_sig, 0);
+		nng_free(verifier, 0);
+		return NULL;
+	}
+	ssb64sz++;
+	char  *ssb64   = nng_alloc(ssb64sz);
+	size_t tlen = 0;
+	if (ssb64 && server_sig) {
+		tlen = nmq_base64_encode((const unsigned char *) server_sig,
+		        ctx->digestsz, ssb64, ssb64sz);
+	}
+
+	if (tlen == (size_t) -1 || tlen == 0) {
 		nng_free(authmsg, authmsg_sz);
 		if (server_sig)
 			nng_free(server_sig, 0);
@@ -815,6 +878,7 @@ scram_handle_server_final_msg(void *arg, const char *msg, int len)
 	if (0 == strcmp(verifier, ssb64)) {
 		result = arg;
 	}
+
 	nng_free(authmsg, authmsg_sz);
 	nng_free(ssb64, 0);
 	nng_free(server_sig, 0);
