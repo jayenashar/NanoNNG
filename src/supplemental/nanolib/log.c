@@ -35,6 +35,7 @@ typedef struct {
 	log_func  fn;
 	void *    udata;
 	uint8_t   level;
+	bool      is_trace; // a protocol-trace sink, filtered by category
 	nng_mtx * mtx;
 	conf_log *config;
 } log_callback;
@@ -54,6 +55,25 @@ static const char *level_strings[] = {
 	"TRACE",
 };
 
+static uint32_t trace_mask = 0;
+
+static size_t trace_payload_limit = NMQ_TRACE_PAYLOAD_LIMIT_DEFAULT;
+
+static const struct {
+	uint32_t    bit;
+	const char *name;
+} trace_categories[] = {
+	{ NMQ_TRACE_CONNECT, "connect" },
+	{ NMQ_TRACE_AUTH, "auth" },
+	{ NMQ_TRACE_SUB, "sub" },
+	{ NMQ_TRACE_PUB, "pub" },
+	{ NMQ_TRACE_PAYLOAD, "payload" },
+	{ NMQ_TRACE_SESSION, "session" },
+	{ NMQ_TRACE_TLS, "tls" },
+	{ NMQ_TRACE_ACL, "acl" },
+	{ 0, NULL },
+};
+
 #ifdef LOG_USE_COLOR
 static const char *level_colors[] = {
 	"\x1b[35m",
@@ -67,6 +87,21 @@ static const char *level_colors[] = {
 
 static void file_rotation(FILE *fp, conf_log *config);
 
+// A trace sink can write a line per message, where the build-time absolute
+// path is a third of the bytes and tells the reader nothing. Ordinary log
+// lines keep the full path they have always had.
+static const char *
+event_source_file(const log_event *ev)
+{
+	const char *slash;
+
+	if (ev->category == 0 || ev->file == NULL) {
+		return ev->file;
+	}
+	slash = strrchr(ev->file, '/');
+	return slash != NULL ? slash + 1 : ev->file;
+}
+
 static void
 stdout_callback(log_event *ev)
 {
@@ -77,15 +112,20 @@ stdout_callback(log_event *ev)
 	pid_t pid = syscall(__NR_gettid);
 #endif
 
+	const char *tag = ev->category == 0
+	    ? level_strings[ev->level]
+	    : log_trace_category_string(ev->category);
+	int tag_width = ev->category == 0 ? 5 : 7;
+
 	buf[strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &ev->time)] = '\0';
 #ifdef LOG_USE_COLOR
 	fprintf(ev->udata,
-	    "%s [%i] %s%-5s\x1b[0m \x1b[0m%s:%d \x1b[0m %s: ", buf, pid,
-	    level_colors[ev->level], level_strings[ev->level], ev->file,
+	    "%s [%i] %s%-*s\x1b[0m \x1b[0m%s:%d \x1b[0m %s: ", buf, pid,
+	    level_colors[ev->level], tag_width, tag, event_source_file(ev),
 	    ev->line, ev->func);
 #else
-	fprintf(ev->udata, "%s [%i] %-5s %s:%d %s: ", buf, pid,
-	    level_strings[ev->level], ev->file, ev->line, ev->func);
+	fprintf(ev->udata, "%s [%i] %-*s %s:%d %s: ", buf, pid,
+	    tag_width, tag, event_source_file(ev), ev->line, ev->func);
 #endif
 	vfprintf(ev->udata, ev->fmt, ev->ap);
 	fprintf(ev->udata, "\n");
@@ -114,9 +154,13 @@ file_callback(log_event *ev)
 	if (ev->config->fp == NULL)
 		ev->config->fp = fopen(ev->config->abs_path, "a");
 	FILE *fp = ev->config->fp;
+	const char *tag = ev->category == 0
+	    ? level_strings[ev->level]
+	    : log_trace_category_string(ev->category);
+	int tag_width = ev->category == 0 ? 5 : 7;
 	buf[strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &ev->time)] = '\0';
-	fprintf(fp, "%s [%i] %-5s %s:%d: ", buf, pid,
-	    level_strings[ev->level], ev->file, ev->line);
+	fprintf(fp, "%s [%i] %-*s %s:%d: ", buf, pid,
+	    tag_width, tag, event_source_file(ev), ev->line);
 	vfprintf(fp, ev->fmt, ev->ap);
 	fprintf(fp, "\n");
 	fflush(fp);
@@ -313,6 +357,179 @@ log_level_num(const char *level)
 	}
 	return -1;
 }
+
+uint32_t
+log_trace_category_num(const char *name)
+{
+	if (name == NULL) {
+		return 0;
+	}
+	if (nni_strcasecmp(name, "all") == 0) {
+		return NMQ_TRACE_ALL;
+	}
+	for (int i = 0; trace_categories[i].name != NULL; i++) {
+		if (nni_strcasecmp(name, trace_categories[i].name) == 0) {
+			return trace_categories[i].bit;
+		}
+	}
+	return 0;
+}
+
+const char *
+log_trace_category_string(uint32_t category)
+{
+	for (int i = 0; trace_categories[i].name != NULL; i++) {
+		if (trace_categories[i].bit == category) {
+			return trace_categories[i].name;
+		}
+	}
+	return "trace";
+}
+
+void
+log_trace_categories_string(uint32_t categories, char *out, size_t out_sz)
+{
+	size_t used = 0;
+
+	if (out == NULL || out_sz == 0) {
+		return;
+	}
+	out[0] = '\0';
+	for (int i = 0; trace_categories[i].name != NULL; i++) {
+		size_t name_len;
+		if (0 == (categories & trace_categories[i].bit)) {
+			continue;
+		}
+		name_len = strlen(trace_categories[i].name);
+		if (used + name_len + 2 > out_sz) {
+			break;
+		}
+		if (used > 0) {
+			out[used++] = ',';
+		}
+		memcpy(out + used, trace_categories[i].name, name_len);
+		used += name_len;
+	}
+	if (used == 0) {
+		snprintf(out, out_sz, "none");
+		return;
+	}
+	out[used] = '\0';
+}
+
+uint32_t
+log_trace_categories_parse(const char *list)
+{
+	uint32_t    categories = 0;
+	const char *p          = list;
+
+	if (list == NULL) {
+		return 0;
+	}
+	while (*p != '\0') {
+		char     name[32];
+		size_t   n = 0;
+		uint32_t bit;
+
+		while (*p == ',' || *p == ' ' || *p == '\t') {
+			p++;
+		}
+		while (*p != '\0' && *p != ',' && *p != ' ' && *p != '\t') {
+			if (n + 1 < sizeof(name)) {
+				name[n++] = *p;
+			}
+			p++;
+		}
+		if (n == 0) {
+			continue;
+		}
+		name[n] = '\0';
+		if ((bit = log_trace_category_num(name)) == 0) {
+			log_error("Unknown log trace category %s", name);
+			continue;
+		}
+		categories |= bit;
+	}
+	return categories;
+}
+
+// For trace category hot update, driven by `nanomq reload`. The caller must
+// have registered a trace sink first, otherwise the events are formatted and
+// then dropped. Raced deliberately, as log_update_level() already races
+// L.level.
+void
+log_trace_set_categories(uint32_t categories)
+{
+	trace_mask = categories;
+}
+
+uint32_t
+log_trace_get_categories(void)
+{
+	return trace_mask;
+}
+
+void
+log_trace_set_payload_limit(size_t limit)
+{
+	trace_payload_limit = limit;
+}
+
+size_t
+log_trace_get_payload_limit(void)
+{
+	return trace_payload_limit;
+}
+
+void
+log_trace_escape(
+    const void *data, size_t len, size_t limit, char *out, size_t out_sz)
+{
+	static const char hex[] = "0123456789abcdef";
+	const uint8_t    *src   = data;
+	size_t            used  = 0;
+	size_t            shown = len;
+	size_t            i;
+
+	// Needs room for the longest escape (4) plus the truncation marker (3)
+	// plus the NUL, so refuse a buffer that cannot hold them.
+	if (out == NULL || out_sz < 8) {
+		if (out != NULL && out_sz > 0) {
+			out[0] = '\0';
+		}
+		return;
+	}
+	out[0] = '\0';
+	if (src == NULL) {
+		return;
+	}
+	if (limit != 0 && shown > limit) {
+		shown = limit;
+	}
+	for (i = 0; i < shown && used + 8 <= out_sz; i++) {
+		uint8_t c = src[i];
+		if (c == '\\') {
+			out[used++] = '\\';
+			out[used++] = '\\';
+		} else if (c >= 0x20 && c < 0x7f) {
+			out[used++] = (char) c;
+		} else {
+			out[used++] = '\\';
+			out[used++] = 'x';
+			out[used++] = hex[c >> 4];
+			out[used++] = hex[c & 0x0f];
+		}
+	}
+	// i < len covers both causes of a short render: the configured limit
+	// and the buffer running out.
+	if (i < len) {
+		out[used++] = '.';
+		out[used++] = '.';
+		out[used++] = '.';
+	}
+	out[used] = '\0';
+}
+
 // for log level hot update
 void
 log_update_level(int new_level)
@@ -331,23 +548,31 @@ log_set_level(int level)
 	L.level = level;
 }
 
-int
-log_add_callback(
-    log_func fn, void *udata, int level, void *mtx, conf_log *config)
+static int
+log_add_callback_cat(log_func fn, void *udata, int level, void *mtx,
+    conf_log *config, bool is_trace)
 {
 	for (int i = 0; i < MAX_CALLBACKS; i++) {
 		if (!L.callbacks[i].fn) {
 			L.callbacks[i] = (log_callback) {
-				.fn     = fn,
-				.udata  = udata,
-				.level  = level,
-				.mtx    = (nng_mtx *) mtx,
-				.config = config,
+				.fn       = fn,
+				.udata    = udata,
+				.level    = level,
+				.is_trace = is_trace,
+				.mtx      = (nng_mtx *) mtx,
+				.config   = config,
 			};
 			return 0;
 		}
 	}
 	return -1;
+}
+
+int
+log_add_callback(
+    log_func fn, void *udata, int level, void *mtx, conf_log *config)
+{
+	return log_add_callback_cat(fn, udata, level, mtx, config, false);
 }
 
 void
@@ -458,6 +683,22 @@ log_add_console(int level, void *mtx)
 	log_add_callback(stdout_callback, stdout, level, mtx, NULL);
 }
 
+// A trace sink is filtered by category rather than by level, so it is
+// registered at NNG_LOG_TRACE and the level never gates it.
+int
+log_add_trace_fp(FILE *fp, void *mtx, conf_log *config)
+{
+	return log_add_callback_cat(
+	    file_callback, fp, NNG_LOG_TRACE, mtx, config, true);
+}
+
+void
+log_add_trace_console(void *mtx)
+{
+	log_add_callback_cat(
+	    stdout_callback, stdout, NNG_LOG_TRACE, mtx, NULL, true);
+}
+
 static void
 init_event(log_event *ev, void *udata, conf_log *config)
 {
@@ -467,33 +708,62 @@ init_event(log_event *ev, void *udata, conf_log *config)
 	ev->config = config;
 }
 
-void
-log_log(int level, const char *file, int line, const char *func,
-    const char *fmt, ...)
+// An ordinary log event reaches the ordinary sinks and a trace event reaches
+// the trace sinks, so raising log.level never floods the trace file and
+// enabling a trace category never floods nanomq.log.
+static void
+log_emit(int level, uint32_t category, const char *file, int line,
+    const char *func, const char *fmt, va_list ap)
 {
-	const char *file_name = file;
-
 	log_event ev = {
-		.fmt   = fmt,
-		.file  = file_name,
-		.line  = line,
-		.level = level,
-		.func  = func,
+		.fmt      = fmt,
+		.file     = file,
+		.line     = line,
+		.level    = level,
+		.category = category,
+		.func     = func,
 	};
 
 	for (int i = 0; i < MAX_CALLBACKS && L.callbacks[i].fn; i++) {
 		log_callback *cb = &L.callbacks[i];
-		if (level <= cb->level) {
-			init_event(&ev, cb->udata, cb->config);
-			va_start(ev.ap, fmt);
-			if (cb->mtx == NULL) {
-				cb->fn(&ev);
-			} else {
-				nng_mtx_lock(cb->mtx);
-				cb->fn(&ev);
-				nng_mtx_unlock(cb->mtx);
+		if (category == 0) {
+			if (cb->is_trace || level > cb->level) {
+				continue;
 			}
-			va_end(ev.ap);
+		} else if (!cb->is_trace) {
+			continue;
 		}
+		init_event(&ev, cb->udata, cb->config);
+		va_copy(ev.ap, ap);
+		if (cb->mtx == NULL) {
+			cb->fn(&ev);
+		} else {
+			nng_mtx_lock(cb->mtx);
+			cb->fn(&ev);
+			nng_mtx_unlock(cb->mtx);
+		}
+		va_end(ev.ap);
 	}
+}
+
+void
+log_log(int level, const char *file, int line, const char *func,
+    const char *fmt, ...)
+{
+	va_list ap;
+
+	va_start(ap, fmt);
+	log_emit(level, 0, file, line, func, fmt, ap);
+	va_end(ap);
+}
+
+void
+log_log_trace(uint32_t category, const char *file, int line, const char *func,
+    const char *fmt, ...)
+{
+	va_list ap;
+
+	va_start(ap, fmt);
+	log_emit(NNG_LOG_TRACE, category, file, line, func, fmt, ap);
+	va_end(ap);
 }

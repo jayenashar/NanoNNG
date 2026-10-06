@@ -477,10 +477,20 @@ nni_pipe_set_pid(nni_pipe *new_pipe, uint32_t id)
 	#endif
 	// we leave session restore job to protocol layer.
 	if ((p = nni_id_get(&pipes, id)) != NULL) {
-		rv = nni_id_set(&pipes, id, new_pipe);
+		bool cached = nni_atomic_get_bool(&p->cache);
+		rv          = nni_id_set(&pipes, id, new_pipe);
 		// Kick out duplicated Client ID
 		nni_mtx_unlock(&pipes_lk);
-		if (!nni_atomic_get_bool(&p->cache) || rv != 0) {
+		// The pipe id is a hash of the client id, so a collision here
+		// IS a second connection on one client id. This is the path a
+		// clean-session client takes; the cached-session path is traced
+		// in nano_pipe_start.
+		nmq_trace(NMQ_TRACE_SESSION,
+		    "session clientid_collision pipe=%u old_cached=%d rv=%d "
+		    "action=%s",
+		    id, cached ? 1 : 0, rv,
+		    (!cached || rv != 0) ? "close_old" : "inherit");
+		if (!cached || rv != 0) {
 			log_error("Client ID collision or set ID failed!");
 			// Must close old pipe first to make it like a normal disconnect
 			// so that new pipe can inherit.
